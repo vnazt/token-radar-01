@@ -158,6 +158,7 @@ function liveHTML() {
 }
 
 function renderBoard() {
+  document.getElementById('model-bar').style.display = '';
   view.innerHTML = `${controlsHTML()}
     <table class="board">${headHTML()}<tbody id="tbody"></tbody></table>
     ${liveHTML()}`;
@@ -212,6 +213,7 @@ function bandHTML(r) {
 }
 
 function renderDetail(r) {
+  document.getElementById('model-bar').style.display = 'none';
   const net = r.plan_reward_usd - r.plan_cost_usd;
   view.innerHTML = `
     <a class="back" href="#/">&larr; Back to the board</a>
