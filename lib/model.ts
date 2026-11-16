@@ -417,6 +417,7 @@ export interface Radar {
   early_size: number;
   live_size: number;
   audited_size: number;
+  watchlist_size: number;
 }
 
 /** Build the whole radar from the snapshot: fit, price, rank, plan. */
@@ -468,6 +469,7 @@ export function buildRadar(snap: Snapshot): { board: BoardRow[]; radar: Radar } 
     early_size: rows.length,
     live_size: live.length,
     audited_size: snap.protocols.filter(isPreToken).length,
+    watchlist_size: snap.watchlist.length,
   };
   return { board: rows, radar };
 }
