@@ -100,8 +100,8 @@ table.board tbody tr:last-child td { border-bottom: none; }
 .band { color: var(--faint); font-size: 12px; display: block; font-family: var(--mono); }
 .pos { color: var(--accent); } .neg { color: var(--red); } .flat { color: var(--dim); }
 .chip { display: inline-block; border-radius: 20px; padding: 1px 10px 2px; font-size: 12.5px; border: 1px solid; white-space: nowrap; }
-.chip.farm { color: var(--accent); border-color: var(--accent-dim); background: rgba(61, 220, 151, .08); }
-.chip.thin { color: var(--amber); border-color: #6b5316; background: rgba(245, 181, 68, .07); }
+.chip.worth { color: var(--accent); border-color: var(--accent-dim); background: rgba(61, 220, 151, .08); }
+.chip.marginal { color: var(--amber); border-color: #6b5316; background: rgba(245, 181, 68, .07); }
 .chip.skip { color: var(--red); border-color: #6e2f2f; background: rgba(242, 109, 109, .07); }
 .net { font-family: var(--mono); font-size: 13px; }
 
@@ -136,3 +136,48 @@ table.board tbody tr:last-child td { border-bottom: none; }
 }
 .foot { margin-top: 34px; border-top: 1px solid var(--line-soft); padding-top: 14px; color: var(--faint); font-size: 12.5px; }
 .empty { color: var(--dim); padding: 26px 4px; }
+
+/* Model section v2: fit plot and proof tables beside the method */
+.model-cols { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr); gap: 26px; }
+@media (max-width: 900px) { .model-cols { grid-template-columns: 1fr; } }
+.model-side h3 { margin: 2px 0 8px; font-size: 12.5px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+svg.scatter { width: 100%; height: auto; margin-top: 12px; background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 10px; }
+svg.scatter .grid { stroke: #182234; stroke-width: 1; }
+svg.scatter .ax, svg.scatter .ay { fill: var(--faint); font-size: 9.5px; font-family: var(--mono); }
+svg.scatter .ay { text-anchor: end; }
+svg.scatter .bandpoly { fill: rgba(61, 220, 151, .07); }
+svg.scatter .curve { stroke: var(--accent); stroke-width: 1.6; }
+svg.scatter .cdot { fill: #dbe4ee; }
+svg.scatter .cfit { fill: none; stroke: var(--accent); stroke-width: 1.1; }
+.figcap { color: var(--faint); font-size: 12.5px; margin-top: 6px; }
+table.ablation { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.ablation th, table.ablation td { padding: 6px 8px; border-bottom: 1px solid var(--line-soft); text-align: left; }
+table.ablation th { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; }
+table.ablation td.n, table.ablation th.n { text-align: right; font-family: var(--mono); }
+table.ablation tr:last-child td { color: var(--text); font-weight: 600; }
+.wf { color: var(--dim); font-size: 13px; margin-top: 10px; }
+
+/* Board range bars */
+.rbar { position: relative; display: block; height: 7px; margin: 5px 0 3px; background: #131b26; border: 1px solid var(--line-soft); border-radius: 5px; min-width: 110px; }
+.rbar .rseg { position: absolute; top: 0; bottom: 0; background: rgba(61, 220, 151, .35); border-radius: 4px; }
+.rbar .rmark { position: absolute; top: -2px; width: 2px; height: 9px; background: var(--accent); }
+
+/* Detail v2: decomposition, evidence tables, timeline */
+.decomp { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; margin: 12px 0 4px; }
+.dcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 150px; flex: 1; }
+.dcard b { display: block; font-size: 19px; font-family: var(--mono); color: var(--text); }
+.dcard span { color: var(--faint); font-size: 12px; }
+.dcard.hot { border-color: var(--accent-dim); background: rgba(61, 220, 151, .06); }
+.dcard.hot b { color: var(--accent); }
+.dop { align-self: center; color: var(--faint); font-family: var(--mono); font-size: 16px; }
+.bandbar .range.wide { background: rgba(61, 220, 151, .12); border: none; }
+.bandbar .range.core { background: rgba(61, 220, 151, .38); top: 2px; bottom: 2px; }
+.record { color: var(--dim); font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 10px; padding: 10px 14px; }
+table.comps, table.steps { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 13.5px; }
+table.comps th, table.comps td, table.steps th, table.steps td { padding: 8px 12px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
+table.comps thead th, table.steps thead th { background: #131b26; color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; }
+table.comps td.n, table.steps td.n { text-align: right; font-family: var(--mono); white-space: nowrap; }
+table.comps tr:last-child td, table.steps tr:last-child td { border-bottom: none; }
+table.steps td.when { color: var(--accent); font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+table.steps td.stepno { color: var(--faint); }
+h3.section-h { margin-top: 24px; }

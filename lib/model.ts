@@ -10,21 +10,29 @@
 //   2. FIT. A weighted-least-squares line in log space, weights TVL^0.25 so the prices of large
 //      protocols speak louder than small ones without shouting the rest down:
 //        log10(mcap) = a + b*log10(TVL) + c*growth + d*log10(age in days),
-//      fitted on the cleaned comps only. Growth is the snapshot's seven-day TVL change, clamped;
-//      age is how long DefiLlama has tracked the protocol, the snapshot's own clock for how long
-//      it has run. No protocol name is ever an input: the same fitted line prices every row.
-//   3. PROOF. The fit is tested blind by leave-one-out: each comp is priced by a line that never
-//      saw it, and the spread of those misses is published with the board. The median miss is the
-//      model's error multiple; the 75th-percentile miss sets the low/high band on every row, so a
-//      row's band is exactly as wide as the model has earned.
+//      fitted on the cleaned comps only, with the comps it cannot explain at 2.25 robust sigmas
+//      dropped and the line refitted. Growth is the snapshot's seven-day TVL change, clamped;
+//      age is how long DefiLlama has tracked the protocol. No protocol name is ever an input:
+//      the same fitted line prices every row.
+//   3. PROOF, FOUR WAYS. (a) Leave-one-out: each comp is priced by a line that never saw it; the
+//      median miss is the model's error multiple and the interquartile range of the signed
+//      misses draws every row's band. (b) An ablation ladder: the same test run on a flat
+//      multiple of TVL, on size alone, on size with growth, on size with age, and on the full
+//      line, so every term has to earn its place. (c) A walk-forward: the line is fitted on the
+//      older half of the comps by listing date and tested on the newer half it never saw.
+//      (d) Two hundred seeded refits of the comps give every board row a rank range, P10 to
+//      P90: a rank is a claim, and the range says how hard the data holds it.
 //   4. BOARD. Every pre-token protocol that passes the same hygiene the house's watchlist uses
 //      (no wrapped, staked, bridged or exchange product of a token that already trades, no
-//      versioned spin-off) is priced by the line and ranked by implied value. The watchlist is the
-//      floor of the board, never its ceiling.
-//   5. PLANS. Each row carries a farm plan whose steps state their cost in dollars and their span
-//      in weeks, and a verdict netted at the LOW end of the row's band: a stated share of that low
-//      value is assumed to reach early users, one farmer's slice of it is sized against the
-//      capital the plan commits, and the plan is Farm, Thin or Skip by what is left after costs.
+//      versioned spin-off) is priced by the line and ranked by implied value. The watchlist is
+//      the floor of the board, never its ceiling.
+//   5. PLANS. Each row carries an eight-step farm plan whose steps state when they happen, what
+//      they cost and how long they take, including a stop rule and a claim step that only ever
+//      uses the protocol's own bookmarked domain. The economics are printed, not asserted: a
+//      stated share of the implied value is assumed to reach early users, one farmer's slice of
+//      it is their deposit diluted by the protocol's whole TVL, and the verdict at a $10,000
+//      deposit is Worth farming when the plan breaks even at a 10% launch chance or better,
+//      Marginal to 35%, Skip beyond that. Most large protocols are Skip, and the board says so.
 //
 // Everything below is a pure function of the snapshot bytes: same input, same board, byte for byte.
 
@@ -117,7 +125,9 @@ interface OlsFit {
   beta: number[];
   /** Residuals in the original y units. */
   residuals: number[];
-  /** Leave-one-out absolute residuals in the original y units, exact via the hat matrix. */
+  /** Leave-one-out residuals in the original y units, exact via the hat matrix. */
+  looSigned: number[];
+  /** Absolute leave-one-out residuals. */
   looAbs: number[];
   rSquared: number;
 }
@@ -163,15 +173,15 @@ function ols(xs: number[][], ys: number[], ws?: number[]): OlsFit {
   const xtxInv = invert(xtx);
   const beta = xtxInv.map((row) => row.reduce((sum, v, j) => sum + v * xty[j]!, 0));
   const residuals = xs.map((x, i) => ys[i]! - x.reduce((sum, v, j) => sum + v * beta[j]!, 0));
-  const looAbs = tx.map((x, i) => {
+  const looSigned = tx.map((x, i) => {
     const h = Math.min(0.999, leverage(x, xtxInv));
     const eScaled = ty[i]! - x.reduce((sum, v, j) => sum + v * beta[j]!, 0);
-    return Math.abs(eScaled / (1 - h)) / sw[i]!;
+    return eScaled / (1 - h) / sw[i]!;
   });
   const mean = ys.reduce((s, v) => s + v, 0) / ys.length;
   const ssTot = ys.reduce((s, v) => s + (v - mean) ** 2, 0);
   const ssRes = residuals.reduce((s, v) => s + v * v, 0);
-  return { beta, residuals, looAbs, rSquared: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
+  return { beta, residuals, looSigned, looAbs: looSigned.map(Math.abs), rSquared: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
 }
 
 /** Leverage of row i: x_i' (X'X)^-1 x_i. */
@@ -181,16 +191,30 @@ function leverage(x: number[], xtxInv: number[][]): number {
   return h;
 }
 
-/** Median of a copy of the values, sorted ascending. */
+/** A quantile of a copy of the values, sorted ascending. */
 function quantile(values: number[], q: number): number {
   const sorted = [...values].sort((a, b) => a - b);
   if (sorted.length === 0) return 0;
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
 }
 
+/** Median absolute miss as a multiple, plus the share of misses within 3x, for one error set. */
+function missStats(absLogErrors: number[]): { median_x: number; within_3x: number } {
+  return {
+    median_x: Math.pow(10, quantile(absLogErrors, 0.5)),
+    within_3x: absLogErrors.filter((e) => e <= Math.log10(3)).length / Math.max(1, absLogErrors.length),
+  };
+}
+
 // ---------------------------------------------------------------------------
-// The comps: cleaned traded protocols, the fit, and its blind leave-one-out.
+// The comps: cleaned traded protocols, the fit, and its blind tests.
 // ---------------------------------------------------------------------------
+
+export interface AblationRow {
+  label: string;
+  loo_median_x: number;
+  within_3x: number;
+}
 
 export interface ModelReport {
   comps_considered: number;
@@ -201,8 +225,14 @@ export interface ModelReport {
   r_squared: number;
   /** Median leave-one-out miss, as a multiple: the model is typically within this factor. */
   loo_error_multiple: number;
-  /** 75th-percentile leave-one-out miss, as a multiple: the width of every row's band. */
+  /** 75th-percentile leave-one-out miss, as a multiple: the width of every row's wide band. */
   band_multiple: number;
+  /** The ablation ladder, weakest first: every term has to earn its place. */
+  ablation: AblationRow[];
+  /** Walk-forward: fitted on the older half of the comps, tested on the newer half. */
+  walk_forward: { train: number; test: number; median_x: number; within_3x: number };
+  /** Seeded refits behind every row's rank range. */
+  refits: number;
 }
 
 interface Comp {
@@ -232,7 +262,7 @@ function cleanComps(snap: Snapshot, ages: Map<string, number>): { comps: Comp[];
 }
 
 /** Fit the line; drop the comps it cannot explain at 2.25 robust sigmas, refit, at most twice. */
-function fitModel(snap: Snapshot, ages: Map<string, number>): { fit: OlsFit; comps: Comp[]; report: ModelReport } {
+function fitClean(snap: Snapshot, ages: Map<string, number>): { fit: OlsFit; comps: Comp[]; considered: number; merged: number; dropped: number } {
   const { comps: first, considered, merged } = cleanComps(snap, ages);
   let kept = first;
   let fit = ols(kept.map((c) => c.x), kept.map((c) => c.y), kept.map((c) => c.w));
@@ -246,17 +276,84 @@ function fitModel(snap: Snapshot, ages: Map<string, number>): { fit: OlsFit; com
     kept = next;
     fit = ols(kept.map((c) => c.x), kept.map((c) => c.y), kept.map((c) => c.w));
   }
-  const report: ModelReport = {
-    comps_considered: considered,
-    comps_used: kept.length,
-    families_merged: merged,
-    outliers_dropped: dropped,
-    beta: fit.beta,
-    r_squared: fit.rSquared,
-    loo_error_multiple: Math.pow(10, quantile(fit.looAbs, 0.5)),
-    band_multiple: Math.pow(10, quantile(fit.looAbs, 0.75)),
+  return { fit, comps: kept, considered, merged, dropped };
+}
+
+/** The ablation ladder on the cleaned comps: each variant priced blind by leave-one-out. */
+function ablation(comps: Comp[]): AblationRow[] {
+  const rows: AblationRow[] = [];
+  // Flat multiple: predict every comp at the median cap-to-TVL ratio of the others.
+  const logRatio = comps.map((c) => c.y - c.x[1]!);
+  const flatErrs = logRatio.map((r, i) => Math.abs(r - quantile(logRatio.filter((_, j) => j !== i), 0.5)));
+  const flat = missStats(flatErrs);
+  rows.push({ label: 'One flat multiple of TVL', loo_median_x: flat.median_x, within_3x: flat.within_3x });
+  const variants: { label: string; cols: number[] }[] = [
+    { label: 'Size curve (log TVL)', cols: [0, 1] },
+    { label: '+ growth carry', cols: [0, 1, 2] },
+    { label: '+ seasoning (log age)', cols: [0, 1, 3] },
+    { label: 'Full line (size, growth, age)', cols: [0, 1, 2, 3] },
+  ];
+  for (const v of variants) {
+    const xs = comps.map((c) => v.cols.map((j) => c.x[j]!));
+    const f = ols(xs, comps.map((c) => c.y), comps.map((c) => c.w));
+    const s = missStats(f.looAbs);
+    rows.push({ label: v.label, loo_median_x: s.median_x, within_3x: s.within_3x });
+  }
+  return rows;
+}
+
+/** Walk-forward: fit on the older half of the dated comps, price the newer half blind. */
+function walkForward(comps: Comp[]): { train: number; test: number; median_x: number; within_3x: number } {
+  const dated = comps.filter((c) => c.p.listed_at !== null).sort((a, b) => (a.p.listed_at! < b.p.listed_at! ? -1 : 1));
+  const half = Math.floor(dated.length / 2);
+  const train = dated.slice(0, half);
+  const test = dated.slice(half);
+  if (train.length < 12 || test.length < 4) return { train: train.length, test: test.length, median_x: 0, within_3x: 0 };
+  const f = ols(train.map((c) => c.x), train.map((c) => c.y), train.map((c) => c.w));
+  const errs = test.map((c) => Math.abs(c.x.reduce((s, v, j) => s + v * f.beta[j]!, 0) - c.y));
+  return { train: train.length, test: test.length, ...missStats(errs) };
+}
+
+/** mulberry32: a tiny seeded PRNG, so the refits are the same on every run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-  return { fit, comps: kept, report };
+}
+
+const REFITS = 200;
+const REFIT_SEED = 0x5eed;
+
+/**
+ * Rank ranges: resample the comps with replacement, refit, reprice every subject, and keep
+ * each subject's P10 and P90 rank across the refits. A rank the data holds loosely shows it.
+ */
+function rankRanges(comps: Comp[], subjects: { slug: string; x: number[] }[]): Map<string, { p10: number; p90: number }> {
+  const rand = mulberry32(REFIT_SEED);
+  const ranks = new Map<string, number[]>(subjects.map((s) => [s.slug, []]));
+  for (let r = 0; r < REFITS; r++) {
+    const sample = Array.from({ length: comps.length }, () => comps[Math.floor(rand() * comps.length)]!);
+    let beta: number[];
+    try {
+      beta = ols(sample.map((c) => c.x), sample.map((c) => c.y), sample.map((c) => c.w)).beta;
+    } catch {
+      continue;
+    }
+    const priced = subjects.map((s) => ({ slug: s.slug, v: s.x.reduce((sum, v, j) => sum + v * beta[j]!, 0) }));
+    priced.sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : 1));
+    priced.forEach((row, i) => ranks.get(row.slug)!.push(i + 1));
+  }
+  const out = new Map<string, { p10: number; p90: number }>();
+  for (const s of subjects) {
+    const list = ranks.get(s.slug)!;
+    out.set(s.slug, { p10: Math.round(quantile(list, 0.1)), p90: Math.round(quantile(list, 0.9)) });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,24 +383,26 @@ function passesHygiene(p: SnapshotProtocol): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Farm plans. Every figure a step quotes is computed here from the row and
-// the stated assumptions, so the page and the plan can never disagree.
+// Farm economics and plans. Every figure a step quotes is computed here from
+// the row and the stated assumptions, so the page and the plan never disagree.
 // ---------------------------------------------------------------------------
 
 /** The model's stated planning assumptions, printed on the dashboard as-is. */
 export const ASSUMPTIONS: string[] = [
-  'Value model: log10(market cap) fitted by weighted least squares on the cleaned traded comps (one row per token family, $10M+ TVL, weighted by TVL^0.25), on log10(TVL), seven-day TVL growth clamped to -50%..+60%, and log10(days tracked).',
-  'Bands: each row shows the fitted value divided and multiplied by the 75th-percentile leave-one-out miss of that fit, measured blind on the comps.',
-  'Netting: 3% of a row\u2019s low-end value is assumed to reach early users; one farmer\u2019s slice is their committed capital over itself plus the capital assumed to farm alongside, 0.5% of the protocol\u2019s TVL capped at $5M (past that, TVL is passive, not farming).',
-  'Plan cost: gas at $6.00 an action on Ethereum, $0.35 on low-fee chains, $1.20 elsewhere, three actions a week, plus committed capital charged at 5% a year for the plan\u2019s weeks.',
-  'Verdicts: Farm when the netted credit clears the plan cost by $250 or more, Thin when it clears it at all, Skip when it does not.',
+  'Value model: log10(market cap) fitted by weighted least squares on the cleaned traded comps (one row per token family, $10M+ TVL, weighted by TVL^0.25), on log10(TVL), seven-day TVL growth clamped to -50%..+60%, and log10(days tracked). Comps the line cannot explain at 2.25 robust sigmas are dropped and the line refitted, at most twice.',
+  'Validation: leave-one-out on the comps (each priced by a line that never saw it), an ablation ladder from one flat multiple of TVL to the full line, a walk-forward fitted on the older half of the comps by listing date and tested on the newer half, and 200 seeded bootstrap refits behind every rank range.',
+  'Bands: each row shows a P25-P75 range from the signed leave-one-out misses and a wider low/high at the 75th-percentile miss; a row\u2019s band is exactly as wide as the model has earned.',
+  'Economics: 10% of a row\u2019s implied value is assumed to reach early users. One farmer\u2019s slice of it is that share times their deposit over their deposit plus the protocol\u2019s whole TVL - size dilutes, and the board does not pretend otherwise.',
+  'Plan cost: gas at $6.00 an action on Ethereum, $0.35 on low-fee chains, $1.20 elsewhere, three actions a week, plus the deposit charged at 5% a year for the plan\u2019s weeks. Hands-on time is 0.6 hours of setup and closing plus 0.35 hours a week.',
+  'Verdicts at the $10,000 reference deposit: Worth farming when costs break even at a 10% launch chance or better, Marginal to 35%, Skip beyond that. The $1,000 column runs the same plan smaller; its verdict can differ and the detail view shows both.',
 ];
 
-const POOL_SHARE = 0.03;
-const PARTICIPATION = 0.005;
-const PARTICIPATION_CAP = 5_000_000;
+const AIRDROP_SHARE = 0.1;
+const REF_DEPOSIT = 10_000;
+const SMALL_DEPOSIT = 1_000;
 const OPPORTUNITY_RATE = 0.05;
-const FARM_MARGIN = 250;
+const WORTH_MAX_BREAKEVEN = 0.1;
+const MARGINAL_MAX_BREAKEVEN = 0.35;
 
 const CHEAP_CHAINS = new Set([
   'Arbitrum One', 'Base', 'Optimism', 'Polygon', 'BNB Smart Chain', 'Solana', 'Avalanche',
@@ -322,13 +421,31 @@ function usd(n: number): string {
   return `$${Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`;
 }
 
-export type Verdict = 'Farm' | 'Thin' | 'Skip';
+/** Dollars with cents when small, for step costs. */
+function usd2(n: number): string {
+  if (Math.abs(n) >= 1000) return usd(n);
+  return `$${n.toFixed(2)}`;
+}
+
+/** Signed dollars for nets: -$197, never $-197. */
+function usdSigned(n: number): string {
+  return n < 0 ? `-${usd(-n)}` : usd(n);
+}
+
+export type Verdict = 'Worth farming' | 'Marginal' | 'Skip';
 
 export interface FarmPlan {
   steps: string[];
-  cost_usd: number;
   weeks: number;
-  reward_usd: number;
+  hours: number;
+  gas_usd: number;
+  slice_ref_usd: number;
+  cost_ref_usd: number;
+  net_ref_usd: number;
+  breakeven_ref: number;
+  net_small_usd: number;
+  breakeven_small: number;
+  net_per_hour_usd: number;
   verdict: Verdict;
 }
 
@@ -345,42 +462,64 @@ function planGroup(category: string | null): string {
   }
 }
 
-const CORE_STEP: Record<string, (name: string, gas: string) => string> = {
-  dex: (name, gas) => `Swap through ${name}'s pools three times a week, $150-$300 a trade, favouring its highest-TVL pairs; routed volume is the activity a launch snapshot can see, and each swap costs about ${gas} in gas.`,
-  lending: (name) => `Supply about 60% of the capital to ${name}'s main market and borrow a small, safely collateralised amount against it once; leave both sides open so the book records the wallet as a real user.`,
-  yield: (name) => `Deposit about 70% of the capital into ${name}'s flagship vault and leave it there untouched; a vault share that simply sits still for weeks is the clearest early-user signal there is.`,
-  rwa: (name) => `Complete ${name}'s onboarding or verification if it asks for it, then hold a small position in its main real-world-asset pool; expect the onboarding itself to take a few days before size can move.`,
-  curator: (name) => `Allocate about 60% of the capital across ${name}'s two largest curated vaults and stay through a full market cycle; curators reward depositors who remain, not drive-by deposits.`,
-  perps: (name, gas) => `Trade small, hedged size on ${name} three times a week, $100-$200 a position, closing flat each time at about ${gas} a trade; steady volume without directional risk is the record to build.`,
-  generic: (name) => `Use ${name}'s core product three times a week with real size, about $200 a session, and let the history accumulate; regular genuine usage is what a launch allocation can measure.`,
+const CORE_STEP: Record<string, (name: string) => string> = {
+  dex: (name) => `Swap through ${name}'s pools in $150-$300 trades, favouring its highest-TVL pairs; routed volume is the activity a launch snapshot can see.`,
+  lending: (name) => `Supply about 60% of the deposit to ${name}'s main market and borrow a small, safely collateralised amount against it once; leave both sides open so the book records a real user.`,
+  yield: (name) => `Deposit about 70% of the deposit into ${name}'s flagship vault and leave it untouched; a vault share that sits still for weeks is the clearest early-user signal there is.`,
+  curator: (name) => `Allocate about 60% of the deposit across ${name}'s two largest curated vaults and stay through a full market cycle; curators reward depositors who remain, not drive-by deposits.`,
+  perps: (name) => `Trade small, hedged size on ${name}, $100-$200 a position, closing flat each time; steady volume without directional risk is the record to build.`,
+  rwa: (name) => `Complete ${name}'s onboarding or verification if it asks for it, then hold a small position in its main real-world-asset pool; expect onboarding to take a few days before size can move.`,
+  generic: (name) => `Use ${name}'s core product with real size, about $200 a session, and let the history accumulate; regular genuine usage is what a launch allocation can measure.`,
 };
 
-/** Build one row's farm plan: six steps, each stating its cost or its span. */
-function farmPlan(p: SnapshotProtocol, impliedLow: number, onWatchlist: boolean): FarmPlan {
+/** One deposit size run through the stated economics. */
+function economics(deposit: number, implied: number, tvl: number, gasTotal: number, weeks: number): { slice: number; cost: number; net: number; breakeven: number } {
+  const slice = AIRDROP_SHARE * implied * (deposit / (deposit + Math.max(1, tvl)));
+  const cost = gasTotal + deposit * OPPORTUNITY_RATE * (weeks / 52);
+  const net = slice - cost;
+  const breakeven = slice > 0 ? cost / slice : 99;
+  return { slice, cost, net, breakeven };
+}
+
+/** Build one row's farm plan: eight steps, each with its when, its cost and its minutes. */
+function farmPlan(p: SnapshotProtocol, implied: number, onWatchlist: boolean): FarmPlan {
   const chain0 = p.chains[0] ?? 'Ethereum';
   const gas = gasFor(chain0);
-  const capital = onWatchlist ? 2500 : p.tvl_usd >= 20_000_000 ? 1000 : 400;
   const weeks = onWatchlist ? 12 : p.tvl_usd >= 20_000_000 ? 10 : 8;
-  const gasTotal = Math.max(1, Math.round(3 * weeks * gas));
-  const opportunity = Math.round(capital * OPPORTUNITY_RATE * (weeks / 52));
-  const cost = gasTotal + opportunity;
-  const pool = impliedLow * POOL_SHARE;
-  const alongside = Math.min(p.tvl_usd * PARTICIPATION, PARTICIPATION_CAP);
-  const reward = Math.round(pool * (capital / (capital + alongside)));
-  const net = reward - cost;
-  const verdict: Verdict = net >= FARM_MARGIN ? 'Farm' : net >= 0 ? 'Thin' : 'Skip';
+  const gasTotal = 3 * weeks * gas;
+  const hours = Math.round((0.6 + 0.35 * weeks) * 10) / 10;
+  const ref = economics(REF_DEPOSIT, implied, p.tvl_usd, gasTotal, weeks);
+  const small = economics(SMALL_DEPOSIT, implied, p.tvl_usd, gasTotal, weeks);
+  const verdict: Verdict = ref.breakeven <= WORTH_MAX_BREAKEVEN ? 'Worth farming' : ref.breakeven <= MARGINAL_MAX_BREAKEVEN ? 'Marginal' : 'Skip';
   const group = planGroup(p.category);
+  const stopLevel = usd(p.tvl_usd * 0.8);
+  const pct = (x: number) => `${Math.round(Math.min(9.99, x) * 100)}%`;
   const steps: string[] = [
-    `Set up a fresh wallet for ${p.name} and fund it on ${chain0}, its main chain, with about ${usd(capital)} of working capital; keep a separate ${usd(Math.max(10, gasTotal))} of the chain's gas token aside for fees.`,
-    CORE_STEP[group]!(p.name, usd(gas)),
+    `Day 0 \u00b7 $1.00 \u00b7 20 min - Set up a fresh wallet for ${p.name}; open its listing on DefiLlama, follow the official domain from there and bookmark it - that bookmark is the only address a claim will ever come from.`,
+    `Day 0 \u00b7 ${usd2(gas)} \u00b7 15 min - Fund the wallet on ${chain0}, ${p.name}'s main chain, and place the core position at the reference size of $10,000 (the same plan runs at $1,000): ${CORE_STEP[group]!(p.name)}`,
+    `Weekly \u00d7${weeks} \u00b7 ${usd2(3 * gas)} a week \u00b7 15 min a week - Repeat the core activity three times a week, every week, at a steady size; a rhythm held for ${weeks} weeks is the record, not any single session.`,
     p.chains.length > 1
-      ? `From week 3, repeat the same activity on ${p.chains[1]}, ${p.name}'s second chain, with about 25% of the capital; multi-chain users are the cohort launches most often over-weight.`
-      : `From week 3, raise the core position by about 25% out of the plan's reserve; a balance that grows reads as conviction, not a one-off visit farmed in an afternoon.`,
-    `Hold the rhythm for ${weeks} weeks: about 3 actions a week comes to roughly ${usd(gasTotal)} of gas, and the committed capital carries about ${usd(opportunity)} of opportunity cost at the stated 5% a year.`,
-    `Check ${p.name}'s own dashboard or points page once a week and leave the position untouched between checks; if a snapshot or eligibility post appears, stop adding size and keep what is placed.`,
-    `Netting at the low end of the band: 3% of ${usd(impliedLow)} is ${usd(pool)} for early users, and this plan's realistic slice of it is about ${usd(reward)} against ${usd(cost)} of cost over ${weeks} weeks - verdict: ${verdict === 'Farm' ? 'Farm it' : verdict === 'Thin' ? 'Thin, farm only with spare capital' : 'Skip, the numbers do not pay'}.`,
+      ? `Week 3 \u00b7 ${usd2(gasFor(p.chains[1]!))} \u00b7 10 min - Repeat the same activity on ${p.chains[1]}, ${p.name}'s second chain, with about 25% of the deposit; multi-chain users are the cohort launches most often over-weight.`
+      : `Week 3 \u00b7 ${usd2(gas)} \u00b7 10 min - Raise the core position by about 25% out of the reserve; a balance that grows reads as conviction, not a one-off visit farmed in an afternoon.`,
+    `Weekly \u00b7 $0.00 \u00b7 10 min - Check ${p.name}'s own dashboard or points page and its TVL against the stop level of ${stopLevel}; leave the position untouched between checks.`,
+    `Any day \u00b7 ${usd2(gas + 0.66)} \u00b7 15 min - Stop rule: if TVL closes under ${stopLevel}, withdrawals pause, or bad debt is reported, withdraw at once and end the plan; no verdict on this board outranks capital safety.`,
+    `Week ${weeks} \u00b7 $0.00 \u00b7 10 min - Hold the position untouched through the final week; if ${p.name} posts a snapshot or an eligibility list, stop adding size at once and keep what is placed.`,
+    `Netting \u00b7 $0.00 \u00b7 0 min - At $10,000: slice if launch ${usd(ref.slice)} = 10% of ${usd(implied)} \u00d7 $10,000/($10,000 + ${usd(p.tvl_usd)} TVL); costs ${usd(ref.cost)} (gas ${usd(gasTotal)} + opportunity ${usd(ref.cost - gasTotal)}); net ${usdSigned(ref.net)}, break-even ${pct(ref.breakeven)}, ${usdSigned(Math.round(ref.net / hours))} an hour over ${hours} hands-on hours. At $1,000: net ${usdSigned(small.net)}, break-even ${pct(small.breakeven)}. Verdict: ${verdict}.`,
   ];
-  return { steps, cost_usd: cost, weeks, reward_usd: reward, verdict };
+  return {
+    steps,
+    weeks,
+    hours,
+    gas_usd: Math.round(gasTotal * 100) / 100,
+    slice_ref_usd: Math.round(ref.slice),
+    cost_ref_usd: Math.round(ref.cost),
+    net_ref_usd: Math.round(ref.net),
+    breakeven_ref: Math.round(Math.min(9.99, ref.breakeven) * 1000) / 1000,
+    net_small_usd: Math.round(small.net),
+    breakeven_small: Math.round(Math.min(9.99, small.breakeven) * 1000) / 1000,
+    net_per_hour_usd: Math.round(ref.net / hours),
+    verdict,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +537,38 @@ export interface BoardRow {
   tvl_usd: number;
   change_7d: number | null;
   age_days: number;
+  /** P25-P75 range from the signed leave-one-out misses. */
+  band25_low_usd: number;
+  band25_high_usd: number;
+  /** Wider low/high at the 75th-percentile leave-one-out miss. */
   implied_low_usd: number;
   implied_high_usd: number;
+  /** Rank range across the 200 seeded refits. */
+  rank_p10: number;
+  rank_p90: number;
   watchlist: boolean;
   verdict: Verdict;
   plan_cost_usd: number;
   plan_weeks: number;
   plan_reward_usd: number;
+  slice_ref_usd: number;
+  net_ref_usd: number;
+  breakeven_ref: number;
+  net_small_usd: number;
+  breakeven_small: number;
+  net_per_hour_usd: number;
+  hands_on_hours: number;
+  gas_usd: number;
+}
+
+/** One cleaned comp, for the fit plot and the detail view's nearest-comps table. */
+export interface CompPoint {
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  mcap_usd: number;
+  curve_usd: number;
+  ratio: number;
 }
 
 export interface Radar {
@@ -413,6 +577,7 @@ export interface Radar {
   model: ModelReport;
   assumptions: string[];
   rows: BoardRow[];
+  comps: CompPoint[];
   live: { name: string; symbol: string; tvl_usd: number; mcap_usd: number }[];
   early_size: number;
   live_size: number;
@@ -420,19 +585,37 @@ export interface Radar {
   watchlist_size: number;
 }
 
-/** Build the whole radar from the snapshot: fit, price, rank, plan. */
+/** Build the whole radar from the snapshot: fit, test, price, rank, plan. */
 export function buildRadar(snap: Snapshot): { board: BoardRow[]; radar: Radar } {
   const ages = ageTable(snap);
-  const { fit, report } = fitModel(snap, ages);
+  const { fit, comps, considered, merged, dropped } = fitClean(snap, ages);
+  const report: ModelReport = {
+    comps_considered: considered,
+    comps_used: comps.length,
+    families_merged: merged,
+    outliers_dropped: dropped,
+    beta: fit.beta,
+    r_squared: fit.rSquared,
+    loo_error_multiple: Math.pow(10, quantile(fit.looAbs, 0.5)),
+    band_multiple: Math.pow(10, quantile(fit.looAbs, 0.75)),
+    ablation: ablation(comps),
+    walk_forward: walkForward(comps),
+    refits: REFITS,
+  };
   const watchlist = new Set(snap.watchlist);
   const subjects = snap.protocols.filter((p) => isPreToken(p) && passesHygiene(p));
-  const rows: BoardRow[] = subjects.map((p) => {
-    const x = features(p, ages.get(p.slug)!);
+  const subjectX = subjects.map((p) => ({ slug: p.slug, x: features(p, ages.get(p.slug)!) }));
+  const ranges = rankRanges(comps, subjectX);
+  const q25 = quantile(fit.looSigned, 0.25);
+  const q75 = quantile(fit.looSigned, 0.75);
+  const rows: BoardRow[] = subjects.map((p, i) => {
+    const x = subjectX[i]!.x;
     const logValue = x.reduce((sum, v, j) => sum + v * fit.beta[j]!, 0);
     const implied = Math.min(100_000_000_000_000, Math.max(1, Math.round(Math.pow(10, logValue))));
     const low = Math.max(1, Math.round(implied / report.band_multiple));
     const high = Math.min(100_000_000_000_000, Math.round(implied * report.band_multiple));
-    const plan = farmPlan(p, low, watchlist.has(p.slug));
+    const plan = farmPlan(p, implied, watchlist.has(p.slug));
+    const range = ranges.get(p.slug)!;
     return {
       slug: p.slug,
       name: p.name,
@@ -444,17 +627,40 @@ export function buildRadar(snap: Snapshot): { board: BoardRow[]; radar: Radar } 
       tvl_usd: p.tvl_usd,
       change_7d: p.change_7d,
       age_days: ages.get(p.slug)!,
+      band25_low_usd: Math.max(1, Math.round(Math.pow(10, logValue + q25))),
+      band25_high_usd: Math.min(100_000_000_000_000, Math.round(Math.pow(10, logValue + q75))),
       implied_low_usd: low,
       implied_high_usd: high,
+      rank_p10: range.p10,
+      rank_p90: range.p90,
       watchlist: watchlist.has(p.slug),
       verdict: plan.verdict,
-      plan_cost_usd: plan.cost_usd,
+      plan_cost_usd: plan.cost_ref_usd,
       plan_weeks: plan.weeks,
-      plan_reward_usd: plan.reward_usd,
+      plan_reward_usd: plan.slice_ref_usd,
+      slice_ref_usd: plan.slice_ref_usd,
+      net_ref_usd: plan.net_ref_usd,
+      breakeven_ref: plan.breakeven_ref,
+      net_small_usd: plan.net_small_usd,
+      breakeven_small: plan.breakeven_small,
+      net_per_hour_usd: plan.net_per_hour_usd,
+      hands_on_hours: plan.hours,
+      gas_usd: plan.gas_usd,
     };
   });
   rows.sort((a, b) => b.implied_value_usd - a.implied_value_usd || b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
   rows.forEach((row, i) => { row.rank = i + 1; });
+  const compPoints: CompPoint[] = comps.map((c) => {
+    const curve = Math.pow(10, c.x.reduce((sum, v, j) => sum + v * fit.beta[j]!, 0));
+    return {
+      name: c.p.name,
+      category: c.p.category,
+      tvl_usd: c.p.tvl_usd,
+      mcap_usd: c.p.mcap_usd!,
+      curve_usd: Math.round(curve),
+      ratio: Math.round((c.p.mcap_usd! / curve) * 100) / 100,
+    };
+  }).sort((a, b) => b.tvl_usd - a.tvl_usd);
   const live = snap.protocols
     .filter(isTraded)
     .map((p) => ({ name: p.name, symbol: p.symbol!, tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd! }))
@@ -465,6 +671,7 @@ export function buildRadar(snap: Snapshot): { board: BoardRow[]; radar: Radar } 
     model: report,
     assumptions: ASSUMPTIONS,
     rows,
+    comps: compPoints,
     live,
     early_size: rows.length,
     live_size: live.length,
